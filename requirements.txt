@@ -1,0 +1,28 @@
+# KernelSight AI - Core Runtime Dependencies
+
+# CLI Framework
+rich==13.7.0
+click==8.1.7
+
+# Web Framework
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+pydantic>=2.0.0  # Version managed by google-genai
+
+# Database
+sqlalchemy==2.0.25
+
+# Data Processing
+pandas==2.1.4
+numpy==1.26.3
+
+# Google Gemini API - Interactions API (requires 1.55.0+ for interactions.create())
+google-genai>=1.55.0
+
+# Configuration
+pyyaml==6.0.1
+python-dotenv==1.0.0
+
+# Utilities
+python-dateutil==2.8.2
+psutil>=5.9.0  # For process monitoring

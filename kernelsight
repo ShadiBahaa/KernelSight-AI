@@ -1,0 +1,573 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2025 KernelSight AI
+"""
+KernelSight CLI - Query & Agent Interface
+
+Professional command-line interface for:
+- Querying system signals
+- Running predictions
+- Interacting with autonomous agent
+- Exporting data as JSON or Markdown
+
+Usage:
+    kernelsight query --type memory_pressure --severity high
+    kernelsight predict --signal-type load_mismatch --duration 30
+    kernelsight agent status
+    kernelsight agent run --max-iterations 3
+"""
+
+import sys
+import os
+import json
+import csv
+import argparse
+from pathlib import Path
+from datetime import datetime
+from typing import Dict, List, Optional
+from io import StringIO
+
+# Add src to path
+sys.path.insert(0, str(Path(__file__).parent / "src"))
+
+try:
+    from pipeline.db_manager import DatabaseManager
+    from agent.agent_tools import AgentTools
+    from agent.autonomous_loop import AutonomousAgent
+except ImportError as e:
+    print(f"Error: Could not import KernelSight modules: {e}")
+    print("Make sure you're running from the project root directory")
+    sys.exit(1)
+
+DB_PATH = Path(__file__).parent / "data" / "kernelsight.db"
+
+
+class CSVFormatter:
+    """Format output as CSV"""
+    
+    @staticmethod
+    def signals_to_csv(signals: List[Dict]) -> str:
+        """Convert signals to CSV format"""
+        if not signals:
+            return "No signals to export\n"
+        
+        output = StringIO()
+        fieldnames = ['timestamp', 'signal_type', 'severity', 'pressure_score', 'summary']
+        
+        writer = csv.DictWriter(output, fieldnames=fieldnames)
+        writer.writeheader()
+        
+        for sig in signals:
+            writer.writerow({
+                'timestamp': datetime.fromtimestamp(sig['timestamp'] / 1_000_000_000).isoformat(),
+                'signal_type': sig['signal_type'],
+                'severity': sig.get('severity', 'unknown'),
+                'pressure_score': sig.get('pressure_score', 0.0),
+                'summary': sig.get('summary', '')
+            })
+        
+        return output.getvalue()
+
+
+class MarkdownFormatter:
+    """Format output as Markdown"""
+    
+    @staticmethod
+    def header(text: str, level: int = 1) -> str:
+        return f"{'#' * level} {text}\n\n"
+    
+    @staticmethod
+    def table(headers: List[str], rows: List[List[str]]) -> str:
+        """Create markdown table"""
+        lines = []
+        
+        # Header
+        lines.append("| " + " | ".join(headers) + " |")
+        lines.append("| " + " | ".join(["---"] * len(headers)) + " |")
+        
+        # Rows
+        for row in rows:
+            lines.append("| " + " | ".join(str(cell) for cell in row) + " |")
+        
+        return "\n".join(lines) + "\n\n"
+    
+    @staticmethod
+    def list_item(text: str, indent: int = 0) -> str:
+        return f"{'  ' * indent}- {text}\n"
+    
+    @staticmethod
+    def code_block(text: str, lang: str = "") -> str:
+        return f"```{lang}\n{text}\n```\n\n"
+    
+    @staticmethod
+    def bold(text: str) -> str:
+        return f"**{text}**"
+    
+    @staticmethod
+    def italic(text: str) -> str:
+        return f"*{text}*"
+
+
+class KernelSightCLI:
+    """Main CLI application"""
+    
+    def __init__(self, db_path: Path):
+        self.db_path = db_path
+        self.db = DatabaseManager(str(db_path))
+        self.tools = AgentTools(str(db_path))
+        self.formatter = MarkdownFormatter()
+    
+    def query_signals(self, args) -> Dict:
+        """Query signals from database"""
+        # Build query parameters
+        params = {
+            'signal_types': [args.type] if args.type else None,
+            'severity_min': args.severity,
+            'limit': args.limit,
+            'lookback_minutes': args.lookback
+        }
+        
+        result = self.tools.query_signals(**{k: v for k, v in params.items() if v is not None})
+        
+        return result
+    
+    def format_query_output(self, result: Dict, format_type: str = 'markdown') -> str:
+        """Format query results"""
+        if format_type == 'json':
+            return json.dumps(result, indent=2)
+        
+        if format_type == 'csv':
+            csv_formatter = CSVFormatter()
+            return csv_formatter.signals_to_csv(result.get('signals', []))
+        
+        # Markdown format
+        output = []
+        output.append(self.formatter.header("Signal Query Results"))
+        
+        # Summary
+        output.append(self.formatter.bold("Summary"))
+        output.append(f"\n{result.get('summary', 'No signals found')}\n\n")
+        
+        # Signals table
+        if result.get('signals'):
+            headers = ["Type", "Severity", "Pressure", "Timestamp", "Summary"]
+            rows = []
+            
+            for sig in result['signals'][:20]:  # Limit to 20 for readability
+                ts = datetime.fromtimestamp(sig['timestamp'] / 1_000_000_000).strftime("%H:%M:%S")
+                rows.append([
+                    sig['signal_type'].replace('_', ' ').title(),
+                    sig['severity'].upper(),
+                    f"{sig.get('pressure_score', 0):.2f}",
+                    ts,
+                    sig.get('summary', 'N/A')[:40] + "..."
+                ])
+            
+            output.append(self.formatter.table(headers, rows))
+        else:
+            output.append(f"{self.formatter.italic('No signals found matching criteria')}\n\n")
+        
+        # Stats
+        output.append(self.formatter.header("Statistics", level=2))
+        output.append(self.formatter.list_item(f"Total Signals: {result['signal_count']}"))
+        output.append(self.formatter.list_item(f"Time Range: Last {result.get('lookback_minutes', 'N/A')} minutes"))
+        
+        return "".join(output)
+    
+    def predict_scenario(self, args) -> Dict:
+        """Run counterfactual prediction"""
+        result = self.tools.simulate_scenario(
+            signal_type=args.signal_type,
+            duration_minutes=args.duration,
+            custom_slope=args.slope
+        )
+        
+        return result
+    
+    def format_prediction_output(self, result: Dict, json_output: bool = False) -> str:
+        """Format prediction results"""
+        if json_output:
+            return json.dumps(result, indent=2)
+        
+        output = []
+        output.append(self.formatter.header("Counterfactual Prediction"))
+        
+        if 'error' in result:
+            output.append(f"❌ {self.formatter.bold('Error')}: {result['error']}\n\n")
+            return "".join(output)
+        
+        # Risk assessment
+        risk_level = result.get('risk_level', 'unknown')
+        risk_icons = {
+            'low': '🟢',
+            'medium': '🟡',
+            'high': '🟠',
+            'critical': '🔴'
+        }
+        
+        output.append(f"{risk_icons.get(risk_level, '⚪')} {self.formatter.bold('Risk Level')}: {risk_level.upper()}\n\n")
+        
+        # Scenario description
+        output.append(self.formatter.header("Scenario", level=2))
+        output.append(f"{result.get('scenario_description', 'N/A')}\n\n")
+        
+        # Projected values
+        if 'projected_value' in result:
+            output.append(self.formatter.header("Projection", level=2))
+            output.append(self.formatter.list_item(f"Current: {result.get('current_value', 'N/A'):.3f}"))
+            output.append(self.formatter.list_item(f"Projected: {result.get('projected_value', 'N/A'):.3f}"))
+            output.append(self.formatter.list_item(f"Change: +{(result.get('projected_value', 0) - result.get('current_value', 0)):.3f}"))
+        
+        return "".join(output)
+    
+    def agent_status(self, args) -> Dict:
+        """Get agent status"""
+        # Check if agent is running
+        agent_log = Path(__file__).parent / "logs" / "production" / "agent.log"
+        
+        if not agent_log.exists():
+            return {
+                'status': 'offline',
+                'message': 'Agent not running or no log file found'
+            }
+        
+        # Get recent activity
+        with open(agent_log, 'r') as f:
+            lines = f.readlines()[-50:]
+        
+        # Parse activity
+        phases = []
+        for line in lines:
+            for phase in ['OBSERVE', 'EXPLAIN', 'SIMULATE', 'DECIDE', 'EXECUTE', 'VERIFY']:
+                if f'[{phase}]' in line:
+                    phases.append({
+                        'phase': phase,
+                        'message': line.split(' - ')[-1].strip(),
+                        'timestamp': line.split(' - ')[0] if ' - ' in line else 'N/A'
+                    })
+        
+        return {
+            'status': 'active' if phases else 'idle',
+            'recent_activity': phases[-10:],
+            'log_file': str(agent_log)
+        }
+    
+    def agent_run(self, args) -> Dict:
+        """Run agent cycle"""
+        agent = AutonomousAgent(str(self.db_path))
+        
+        result = agent.analyze_and_act(max_iterations=args.max_iterations)
+        
+        return result
+    
+    def run_diagnostics(self, args) -> Dict:
+        """Run comprehensive system diagnostics"""
+        diagnostics = {
+            'timestamp': datetime.now().isoformat(),
+            'checks': []
+        }
+        
+        # Check 1: Database
+        db_check = {'component': 'Database', 'status': 'ok', 'details': []}
+        try:
+            if self.db_path.exists():
+                size_mb = self.db_path.stat().st_size / (1024 * 1024)
+                db_check['details'].append(f"File exists: {self.db_path}")
+                db_check['details'].append(f"Size: {size_mb:.2f} MB")
+                
+                # Check tables
+                conn = self.db.connect()
+                tables = conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+                db_check['details'].append(f"Tables: {len(tables)}")
+                
+                # Check signal count
+                signal_count = conn.execute("SELECT COUNT(*) FROM signal_metadata").fetchone()[0]
+                db_check['details'].append(f"Total signals: {signal_count:,}")
+                
+                conn.close()
+            else:
+                db_check['status'] = 'error'
+                db_check['details'].append(f"Database not found at {self.db_path}")
+        except Exception as e:
+            db_check['status'] = 'error'
+            db_check['details'].append(f"Error: {str(e)}")
+        
+        diagnostics['checks'].append(db_check)
+        
+        # Check 2: eBPF Binaries
+        ebpf_check = {'component': 'eBPF Tracers', 'status': 'ok', 'details': []}
+        build_dir = Path(__file__).parent / "build" / "src" / "telemetry"
+        
+        tracers = ['syscall_tracer', 'sched_tracer', 'page_fault_tracer', 'io_latency_tracer']
+        for tracer in tracers:
+            tracer_path = build_dir / tracer
+            if tracer_path.exists():
+                ebpf_check['details'].append(f"✓ {tracer}")
+            else:
+                ebpf_check['status'] = 'warning'
+                ebpf_check['details'].append(f"✗ {tracer} (not found)")
+        
+        diagnostics['checks'].append(ebpf_check)
+        
+        # Check 3: Logs
+        log_check = {'component': 'Logs', 'status': 'ok', 'details': []}
+        log_dir = Path(__file__).parent / "logs" / "production"
+        
+        if log_dir.exists():
+            log_files = list(log_dir.glob("*.log"))
+            log_check['details'].append(f"Log directory: {log_dir}")
+            log_check['details'].append(f"Log files: {len(log_files)}")
+            
+            for log_file in log_files:
+                size_kb = log_file.stat().st_size / 1024
+                log_check['details'].append(f"  - {log_file.name}: {size_kb:.1f} KB")
+        else:
+            log_check['status'] = 'warning'
+            log_check['details'].append("Log directory not found")
+        
+        diagnostics['checks'].append(log_check)
+        
+        # Check 4: Agent Status
+        agent_check = {'component': 'Agent', 'status': 'ok', 'details': []}
+        agent_status = self.agent_status(args)
+        
+        agent_check['details'].append(f"Status: {agent_status['status']}")
+        if agent_status.get('recent_activity'):
+            agent_check['details'].append(f"Recent activity: {len(agent_status['recent_activity'])} events")
+        else:
+            agent_check['status'] = 'warning'
+            agent_check['details'].append("No recent activity")
+        
+        diagnostics['checks'].append(agent_check)
+        
+        # Check 5: Dependencies
+        dep_check = {'component': 'Dependencies', 'status': 'ok', 'details': []}
+        dependencies = ['rich', 'google-genai']
+        
+        for dep in dependencies:
+            try:
+                __import__(dep.replace('-', '.'))
+                dep_check['details'].append(f"✓ {dep}")
+            except ImportError:
+                dep_check['status'] = 'warning'
+                dep_check['details'].append(f"✗ {dep} (not installed)")
+        
+        diagnostics['checks'].append(dep_check)
+        
+        # Overall status
+        statuses = [check['status'] for check in diagnostics['checks']]
+        if 'error' in statuses:
+            diagnostics['overall_status'] = 'error'
+        elif 'warning' in statuses:
+            diagnostics['overall_status'] = 'warning'
+        else:
+            diagnostics['overall_status'] = 'healthy'
+        
+        return diagnostics
+    
+    def format_diagnostics_output(self, diagnostics: Dict, format_type: str = 'markdown') -> str:
+        """Format diagnostics results"""
+        if format_type == 'json':
+            return json.dumps(diagnostics, indent=2)
+        
+        # Markdown format
+        output = []
+        output.append(self.formatter.header("System Diagnostics"))
+        
+        # Overall status
+        status_icons = {
+            'healthy': '🟢',
+            'warning': '🟡',
+            'error': '🔴'
+        }
+        
+        overall = diagnostics.get('overall_status', 'unknown')
+        output.append(f"{status_icons.get(overall, '⚪')} {self.formatter.bold('Overall Status')}: {overall.upper()}\n\n")
+        
+        # Component checks
+        output.append(self.formatter.header("Component Status", level=2))
+        
+        for check in diagnostics['checks']:
+            status_icon = '✓' if check['status'] == 'ok' else ('⚠' if check['status'] == 'warning' else '✗')
+            output.append(f"\n{self.formatter.bold(check['component'])} {status_icon}\n")
+            
+            for detail in check['details']:
+                output.append(self.formatter.list_item(detail))
+        
+        # Timestamp
+        output.append(f"\n\n{self.formatter.italic(f'Generated: {diagnostics[\"timestamp\"]}')}\n")
+        
+        return "".join(output)
+    
+    def format_agent_output(self, result: Dict, format_type: str = 'markdown') -> str:
+        """Format agent results"""
+        if format_type == 'json':
+            return json.dumps(result, indent=2)
+        
+        output = []
+        
+        if 'recent_activity' in result:
+            # Status output
+            output.append(self.formatter.header("Agent Status"))
+            
+            status_icon = '🟢' if result['status'] == 'active' else '⚪'
+            output.append(f"{status_icon} {self.formatter.bold('Status')}: {result['status'].upper()}\n\n")
+            
+            if result['recent_activity']:
+                output.append(self.formatter.header("Recent Activity", level=2))
+                for activity in result['recent_activity']:
+                    output.append(self.formatter.list_item(
+                        f"{self.formatter.bold(activity['phase'])}: {activity['message']}"
+                    ))
+        else:
+            # Run output
+            output.append(self.formatter.header("Agent Execution Result"))
+            
+            # Status
+            status = result.get('status', 'unknown')
+            output.append(f"{self.formatter.bold('Status')}: {status}\n\n")
+            
+            # Phases
+            if 'phases' in result:
+                output.append(self.formatter.header("Execution Phases", level=2))
+                
+                for phase_name, phase_data in result['phases'].items():
+                    output.append(f"{self.formatter.bold(phase_name.upper())}:\n")
+                    if isinstance(phase_data, dict):
+                        for key, value in phase_data.items():
+                            output.append(self.formatter.list_item(f"{key}: {value}", indent=1))
+                    output.append("\n")
+            
+            # Action taken
+            output.append(self.formatter.header("Result", level=2))
+            output.append(self.formatter.list_item(f"Action Taken: {'Yes' if result.get('action_taken') else 'No'}"))
+            output.append(self.formatter.list_item(f"Resolved: {'Yes' if result.get('resolved') else 'No'}"))
+        
+        return "".join(output)
+
+
+def main():
+    """Main CLI entry point"""
+    parser = argparse.ArgumentParser(
+        description="KernelSight AI - Autonomous SRE System CLI",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Query critical memory pressure signals
+  kernelsight query --type memory_pressure --severity critical --limit 10
+  
+  # Predict load trends
+  kernelsight predict --signal-type load_mismatch --duration 30
+  
+  # Check agent status
+  kernelsight agent status
+  
+  # Run agent analysis
+  kernelsight agent run --max-iterations 3
+  
+  # Export as JSON
+  kernelsight query --type io_congestion --json
+        """
+    )
+    
+    parser.add_argument('--db', type=str, default=str(DB_PATH),
+                       help='Database path (default: data/kernelsight.db)')
+    parser.add_argument('--json', action='store_true',
+                       help='Output as JSON instead of Markdown')
+    parser.add_argument('--csv', action='store_true',
+                       help='Output as CSV (only for query command)')
+    
+    subparsers = parser.add_subparsers(dest='command', help='Commands')
+    
+    # Query command
+    query_parser = subparsers.add_parser('query', help='Query system signals')
+    query_parser.add_argument('--type', type=str, help='Signal type filter')
+    query_parser.add_argument('--severity', type=str, choices=['low', 'medium', 'high', 'critical'],
+                             help='Minimum severity level')
+    query_parser.add_argument('--limit', type=int, default=20, help='Max results')
+    query_parser.add_argument('--lookback', type=int, default=10, help='Lookback minutes')
+    
+    # Predict command
+    predict_parser = subparsers.add_parser('predict', help='Run counterfactual prediction')
+    predict_parser.add_argument('--signal-type', type=str, required=True,
+                               help='Signal type to predict')
+    predict_parser.add_argument('--duration', type=int, default=30,
+                               help='Prediction duration (minutes)')
+    predict_parser.add_argument('--slope', type=float, help='Custom trend slope')
+    
+    # Agent command
+    agent_parser = subparsers.add_parser('agent', help='Agent operations')
+    agent_subparsers = agent_parser.add_subparsers(dest='agent_command', help='Agent commands')
+    
+    agent_subparsers.add_parser('status', help='Show agent status')
+    
+    run_parser = agent_subparsers.add_parser('run', help='Run agent cycle')
+    run_parser.add_argument('--max-iterations', type=int, default=3,
+                           help='Maximum decision iterations')
+    
+    # Diagnostics command
+    subparsers.add_parser('diagnostics', help='Run system diagnostics')
+    
+    args = parser.parse_args()
+    
+    if not args.command:
+        parser.print_help()
+        sys.exit(1)
+    
+    # Check database
+    db_path = Path(args.db)
+    if not db_path.exists():
+        print(f"Error: Database not found at {db_path}")
+        print("Start the system first: sudo python3 run_kernelsight.py")
+        sys.exit(1)
+    
+    cli = KernelSightCLI(db_path)
+    
+    # Determine output format
+    if args.csv:
+        format_type = 'csv'
+    elif args.json:
+        format_type = 'json'
+    else:
+        format_type = 'markdown'
+    
+    try:
+        # Execute command
+        if args.command == 'query':
+            result = cli.query_signals(args)
+            output = cli.format_query_output(result, format_type)
+        
+        elif args.command == 'predict':
+            result = cli.predict_scenario(args)
+            output = cli.format_prediction_output(result, format_type == 'json')
+        
+        elif args.command == 'diagnostics':
+            result = cli.run_diagnostics(args)
+            output = cli.format_diagnostics_output(result, format_type)
+        
+        elif args.command == 'agent':
+            if args.agent_command == 'status':
+                result = cli.agent_status(args)
+                output = cli.format_agent_output(result, format_type)
+            elif args.agent_command == 'run':
+                result = cli.agent_run(args)
+                output = cli.format_agent_output(result, format_type)
+            else:
+                agent_parser.print_help()
+                sys.exit(1)
+        
+        else:
+            parser.print_help()
+            sys.exit(1)
+        
+        print(output)
+    
+    except Exception as e:
+        print(f"Error: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()
